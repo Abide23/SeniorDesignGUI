@@ -23,8 +23,8 @@ void setup() {
   Serial.begin(115200);
   delay(250);
 
-  Wire.begin();
-  sen5x.begin(Wire);
+  Wire1.begin();
+  sen5x.begin(Wire1);
 
   sen5x.deviceReset();
   sen5x.startMeasurement();

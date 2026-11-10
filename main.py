@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from collections import deque
-import serial
+import socket
 import threading
 import json
 import time
@@ -10,7 +10,6 @@ from datetime import datetime
 
 
 class SeniorDesignGUI:
-    # --- HiDPI SETTINGS ---
     SCALE_FACTOR = 1.5
 
     def __init__(self, root):
@@ -22,9 +21,12 @@ class SeniorDesignGUI:
         self.root.geometry(f"{width}x{height}")
         self.root.tk.call("tk", "scaling", self.SCALE_FACTOR)
 
-        # Serial settings
-        self.serial_port = None
-        self.serial_thread = None
+        # TCP server state. The computer listens for the UNO boards.
+        self.server_socket = None
+        self.server_thread = None
+        self.client_sockets = set()
+        self.client_lock = threading.Lock()
+        self.server_port = None
         self.running = False
 
         # Logging state
@@ -32,11 +34,10 @@ class SeniorDesignGUI:
         self.log_file = None
         self.log_writer = None
 
-        # Store the latest 10 velocity readings for the moving average
-        self.velocity_samples = deque(maxlen=10)
-        self.latest_velocity_average = None
+        # Keep a separate ten-reading velocity window for each board.
+        self.velocity_samples = {}
+        self.latest_velocity_average = {}
 
-        # Data for the informational frames
         self.frame_info = {
             "Inlet temp": {"value": None, "range": (20, 30), "unit": "°C"},
             "Humidity": {"value": None, "range": (20, 100), "unit": "%"},
@@ -66,10 +67,10 @@ class SeniorDesignGUI:
             },
         }
 
-        self.log_headers = ["Date", "Time"] + list(self.frame_info.keys())
-
+        self.log_headers = ["Date", "Time", "Device"] + list(self.frame_info.keys())
         self.ui_elements = {}
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def s_int(self, value):
         return int(value * self.SCALE_FACTOR)
@@ -81,17 +82,17 @@ class SeniorDesignGUI:
         control_bar = ttk.Frame(self.root, padding=self.s_int(5))
         control_bar.pack(fill=tk.X)
 
-        ttk.Label(control_bar, text="Serial Port:").pack(
+        ttk.Label(control_bar, text="TCP Port:").pack(
             side=tk.LEFT, padx=self.s_int(5)
         )
 
-        self.port_entry = ttk.Entry(control_bar, width=self.s_int(15))
-        self.port_entry.insert(0, "/dev/ttyUSB0")
+        self.port_entry = ttk.Entry(control_bar, width=self.s_int(8))
+        self.port_entry.insert(0, "5000")
         self.port_entry.pack(side=tk.LEFT, padx=self.s_int(5))
 
         self.connect_btn = ttk.Button(
             control_bar,
-            text="Connect",
+            text="Start Listening",
             command=self.toggle_connection,
         )
         self.connect_btn.pack(side=tk.LEFT, padx=self.s_int(5))
@@ -106,7 +107,7 @@ class SeniorDesignGUI:
 
         self.status_label = ttk.Label(
             control_bar,
-            text="Disconnected",
+            text="Not listening",
             foreground="red",
         )
         self.status_label.pack(side=tk.LEFT, padx=self.s_int(10))
@@ -114,11 +115,8 @@ class SeniorDesignGUI:
         self.main_container = ttk.Frame(self.root, padding=self.s_int(20))
         self.main_container.pack(fill=tk.BOTH, expand=True)
 
-        # Grid layout: 3 columns
         for i in range(3):
             self.main_container.columnconfigure(i, weight=1)
-
-        # Ten items require four rows
         for i in range(4):
             self.main_container.rowconfigure(i, weight=1)
 
@@ -167,33 +165,114 @@ class SeniorDesignGUI:
 
     def toggle_connection(self):
         if not self.running:
-            port = self.port_entry.get()
-
+            listener = None
             try:
-                self.serial_port = serial.Serial(port, 115200, timeout=1)
+                port = int(self.port_entry.get().strip())
+                if not 1 <= port <= 65535:
+                    raise ValueError("TCP port must be between 1 and 65535.")
+
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("0.0.0.0", port))
+                listener.listen(8)
+                listener.settimeout(0.5)
+
+                self.server_socket = listener
+                self.server_port = port
                 self.running = True
-
-                # Start a fresh moving-average window for each connection
                 self.velocity_samples.clear()
-                self.latest_velocity_average = None
+                self.latest_velocity_average.clear()
 
-                self.connect_btn.config(text="Disconnect")
+                self.connect_btn.config(text="Stop Listening")
                 self.status_label.config(
-                    text=f"Connected to {port}",
+                    text=f"Listening on TCP port {port}",
                     foreground="green",
                 )
                 self.record_btn.config(state="normal")
 
-                self.serial_thread = threading.Thread(
-                    target=self.read_serial,
+                self.server_thread = threading.Thread(
+                    target=self.accept_clients,
                     daemon=True,
                 )
-                self.serial_thread.start()
+                self.server_thread.start()
 
             except Exception as e:
-                messagebox.showerror("Connection Error", str(e))
+                if listener:
+                    listener.close()
+                self.server_socket = None
+                messagebox.showerror("Server Error", str(e))
         else:
             self.stop_connection()
+
+    def accept_clients(self):
+        listener = self.server_socket
+        while self.running and listener:
+            try:
+                client_socket, address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            client_socket.settimeout(1.0)
+            with self.client_lock:
+                self.client_sockets.add(client_socket)
+
+            self.root.after(0, self.refresh_connection_status)
+            threading.Thread(
+                target=self.read_client,
+                args=(client_socket, address),
+                daemon=True,
+            ).start()
+
+    def read_client(self, client_socket, address):
+        buffer = ""
+        try:
+            while self.running:
+                try:
+                    chunk = client_socket.recv(1024)
+                except socket.timeout:
+                    continue
+
+                if not chunk:
+                    break
+
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        data = json.loads(line)
+                        if isinstance(data, dict):
+                            self.root.after(0, self.update_ui_from_data, data)
+                    except json.JSONDecodeError:
+                        print(f"Invalid JSON received from {address}: {line}")
+
+        except OSError as e:
+            if self.running:
+                print(f"Connection error from {address}: {e}")
+        finally:
+            try:
+                client_socket.close()
+            except OSError:
+                pass
+            with self.client_lock:
+                self.client_sockets.discard(client_socket)
+            if self.running:
+                self.root.after(0, self.refresh_connection_status)
+
+    def refresh_connection_status(self):
+        with self.client_lock:
+            count = len(self.client_sockets)
+
+        if self.running:
+            self.status_label.config(
+                text=f"Listening on TCP {self.server_port} | {count} board(s)",
+                foreground="green",
+            )
 
     def stop_connection(self):
         self.running = False
@@ -201,13 +280,38 @@ class SeniorDesignGUI:
         if self.is_recording:
             self.toggle_recording()
 
-        if self.serial_port:
-            self.serial_port.close()
-            self.serial_port = None
+        listener = self.server_socket
+        self.server_socket = None
+        if listener:
+            try:
+                listener.close()
+            except OSError:
+                pass
 
-        self.connect_btn.config(text="Connect")
-        self.status_label.config(text="Disconnected", foreground="red")
+        with self.client_lock:
+            clients = list(self.client_sockets)
+            self.client_sockets.clear()
+
+        for client_socket in clients:
+            try:
+                client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client_socket.close()
+            except OSError:
+                pass
+
+        self.connect_btn.config(text="Start Listening")
+        self.status_label.config(text="Not listening", foreground="red")
         self.record_btn.config(state="disabled")
+
+    def on_close(self):
+        if self.running:
+            self.stop_connection()
+        elif self.is_recording:
+            self.toggle_recording()
+        self.root.destroy()
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -224,10 +328,6 @@ class SeniorDesignGUI:
 
                 self.is_recording = True
                 self.record_btn.config(text="Stop Recording")
-                self.status_label.config(
-                    text=f"Recording: {filename}",
-                    foreground="blue",
-                )
 
             except Exception as e:
                 messagebox.showerror(
@@ -243,73 +343,50 @@ class SeniorDesignGUI:
                 self.log_writer = None
 
             self.record_btn.config(text="Start Recording")
-            self.status_label.config(
-                text="Stopped Recording",
-                foreground="green",
-            )
-
-    def read_serial(self):
-        while self.running:
-            if self.serial_port and self.serial_port.in_waiting > 0:
-                try:
-                    line = self.serial_port.readline().decode("utf-8").strip()
-
-                    if line:
-                        data = json.loads(line)
-                        self.root.after(0, self.update_ui_from_data, data)
-
-                except json.JSONDecodeError:
-                    pass
-                except Exception as e:
-                    print(f"Error reading serial: {e}")
-
-            time.sleep(0.01)
 
     def update_ui_from_data(self, data):
-        # Add the new velocity reading to the 10-reading moving-average window.
-        velocity = data.get("Measured Velocity")
+        device_id = str(data.get("Device", "Unknown"))
 
+        # Keep a separate moving average for each board.
+        velocity = data.get("Measured Velocity")
         if velocity is not None:
             try:
-                self.velocity_samples.append(float(velocity))
+                samples = self.velocity_samples.setdefault(
+                    device_id, deque(maxlen=10)
+                )
+                samples.append(float(velocity))
 
-                # Start displaying the moving average once 10 readings are available.
-                if len(self.velocity_samples) == 10:
-                    self.latest_velocity_average = (
-                        sum(self.velocity_samples) / len(self.velocity_samples)
-                    )
-                    self.update_value_display(
-                        "Measured Velocity",
-                        self.latest_velocity_average,
-                    )
-
+                if len(samples) == 10:
+                    average = sum(samples) / len(samples)
+                    self.latest_velocity_average[device_id] = average
+                    self.update_value_display("Measured Velocity", average)
             except (TypeError, ValueError):
                 pass
 
-        # Update all other sensor displays with each incoming message.
+        # The existing dashboard has one set of display panels, so it shows
+        # the latest value received for each field, regardless of board.
         for key, new_val in data.items():
-            if key == "Measured Velocity":
+            if key in ("Device", "Measured Velocity"):
                 continue
 
             if key in self.frame_info and key in self.ui_elements:
-                self.update_value_display(key, new_val)
+                try:
+                    self.update_value_display(key, float(new_val))
+                except (TypeError, ValueError):
+                    pass
 
-        # Log each incoming message, using the moving average for velocity.
         if self.is_recording and self.log_writer:
             try:
                 now = datetime.now()
                 row = {
                     "Date": now.strftime("%Y-%m-%d"),
                     "Time": now.strftime("%H:%M:%S"),
+                    "Device": device_id,
                 }
 
-                for key in self.frame_info.keys():
+                for key in self.frame_info:
                     if key == "Measured Velocity":
-                        row[key] = (
-                            self.latest_velocity_average
-                            if self.latest_velocity_average is not None
-                            else ""
-                        )
+                        row[key] = self.latest_velocity_average.get(device_id, "")
                     else:
                         row[key] = data.get(key, "")
 
