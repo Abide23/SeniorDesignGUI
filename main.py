@@ -47,13 +47,13 @@ class SeniorDesignGUI:
                 "range": (0, 10),
                 "unit": "m/s",
             },
-            "Outlet temp 1": {"value": None, "range": (30, 60), "unit": "°C"},
-            "Outlet temp 2": {"value": None, "range": (1000, 1020), "unit": "°C"},
-            "Room pressure": {"value": None, "range": (11.5, 12.5), "unit": "Pa"},
-            "Inlet air velocity": {
+            "Outlet temp 1": {"value": None, "range": (20, 30), "unit": "°C"},
+            "Outlet temp 2": {"value": None, "range": (20, 30), "unit": "°C"},
+            "Humidity 1": {"value": None, "range": (20, 100), "unit": "%"},
+            "Humidity 2": {
                 "value": None,
-                "range": (1.0, 2.0),
-                "unit": "ft/s",
+                "range": (20, 100),
+                "unit": "%",
             },
             "Outlet air velocity 1": {
                 "value": None,
